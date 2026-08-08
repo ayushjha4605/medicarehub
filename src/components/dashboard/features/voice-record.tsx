@@ -704,7 +704,38 @@ export function VoiceRecord({ onConvertToRecord, onEmergency }: VoiceRecordProps
             rec.continuous = true
             rec.interimResults = true
             rec.lang = language === "hi" ? "hi-IN" : language === "ta" ? "ta-IN" : "en-IN"
+            // ─── Web Speech API error + restart management ───
+            // The browser's speech recognition service auto-stops after
+            // periods of silence (~5s) or after ~60s of continuous speech.
+ // We restart it so the user can pause for breath and continue.
+            //
+            // PROBLEM with the old approach: restarting called start()
+            // every 250ms, which plays the browser's speech-recognition
+            // "ding" sound → after 5-6s the user heard continuous dings
+            // and the page lagged.
+            //
+            // NEW approach:
+            //  - 2000ms delay between restarts (was 250ms) — 8x fewer dings
+            //  - Cap at 5 restarts total — after ~30s of no speech, stop
+            //  - Track whether we got results. If a session ended almost
+            //    immediately with zero results, the service is malfunctioning
+            //    → don't restart at all (prevents tight loops).
+            //  - Fatal errors (not-allowed, audio-capture) permanently stop
+            //    restarts via `speechDead`.
+            let speechDead = false
+            let restartCount = 0
+            let lastStartTime = Date.now()
+            let gotResultsSinceLastStart = false
+            const MAX_RESTARTS = 5
+            let lastErrorToast = 0
+            const showErrorToast = (title: string, desc: string) => {
+              const now = Date.now()
+              if (now - lastErrorToast < 10000) return
+              lastErrorToast = now
+              toast.error(title, { description: desc })
+            }
             rec.onresult = (e) => {
+              gotResultsSinceLastStart = true
               let full = ""
               for (let i = 0; i < e.results.length; i++) {
                 full += e.results[i][0].transcript
@@ -712,44 +743,25 @@ export function VoiceRecord({ onConvertToRecord, onEmergency }: VoiceRecordProps
               liveTranscriptRef.current = full
               setLiveTranscript(full)
             }
-            // Surface real errors instead of swallowing them silently.
-            // Common errors: "network" (Web Speech API needs internet on Vercel),
-            // "not-allowed" (browser mic permission), "no-speech" (silent mic),
-            // "aborted" (user stopped — expected, ignore).
-            //
-            // CRITICAL: Fatal errors (not-allowed, service-not-allowed,
-            // audio-capture) must mark speech as dead so the onend handler
-            // does NOT auto-restart — otherwise we get an infinite loop of
-            // error → end → restart → error → ... spamming the user with
-            // toasts. "network" is retried because it may be transient.
-            // "no-speech" / "aborted" are benign and restart is fine.
-            let speechDead = false
-            let lastErrorToast = 0
-            const showErrorToast = (title: string, desc: string) => {
-              // Dedupe: don't show the same error toast more than once
-              // per 10 seconds.
-              const now = Date.now()
-              if (now - lastErrorToast < 10000) return
-              lastErrorToast = now
-              toast.error(title, { description: desc })
-            }
             rec.onerror = (e) => {
               const err = e?.error || "unknown"
-              if (err === "aborted" || err === "no-speech") return // benign
+              if (err === "aborted") return // benign — user stopped
+              if (err === "no-speech") {
+                // User hasn't spoken yet — benign. Don't toast, don't kill.
+                // onend will fire and we'll restart gently (2s delay).
+                return
+              }
               speechErrorRef.current = err
               if (err === "network") {
                 showErrorToast(
                   "Speech recognition lost network connection",
-                  "Web Speech API needs internet. Check your connection — recording continues but live transcript may be incomplete."
+                  "Web Speech API needs internet. Recording continues but live transcript may be incomplete."
                 )
               } else if (err === "not-allowed" || err === "service-not-allowed") {
-                // FATAL — don't restart. Recording continues via MediaRecorder;
-                // the server-side ASR fallback (or the client transcript if
-                // partial) will handle transcription on stop.
                 speechDead = true
                 showErrorToast(
                   "Live transcription unavailable",
-                  "Browser blocked Web Speech API. Recording continues — your audio will still be transcribed when you stop."
+                  "Browser blocked Web Speech API. Recording continues — your audio will still be saved."
                 )
               } else if (err === "audio-capture") {
                 speechDead = true
@@ -757,28 +769,43 @@ export function VoiceRecord({ onConvertToRecord, onEmergency }: VoiceRecordProps
                   "No microphone detected",
                   "Connect a mic and try again."
                 )
+              } else {
+                // Unknown error — if it keeps happening, the restart cap
+                // will eventually stop the cycle.
+                showErrorToast(
+                  "Speech recognition issue",
+                  `Error: ${err}. Recording continues — you can stop when done.`
+                )
               }
             }
-            // CRITICAL FIX: Web Speech API auto-stops after a few seconds
-            // of silence (or after ~60s of continuous speech). Restart it
-            // as long as we're still recording AND speech hasn't fatally
-            // errored. Without the speechDead check, a not-allowed error
-            // causes an infinite restart loop (each restart immediately
-            // errors again).
             rec.onend = () => {
               if (!isRecordingRef.current) return
               if (speechDead) return
-              // Small delay to avoid tight-loop if start() keeps failing
+              if (restartCount >= MAX_RESTARTS) return
+              // If the session ended almost immediately (under 2s) with
+              // zero results, the speech service is malfunctioning. Don't
+              // restart — it would create a tight loop of dings.
+              const sessionDuration = Date.now() - lastStartTime
+              if (!gotResultsSinceLastStart && sessionDuration < 2000 && restartCount > 0) {
+                speechDead = true
+                return
+              }
+              restartCount++
+              // 2000ms delay — dramatically reduces the "ding" sound
+              // frequency compared to 250ms.
               setTimeout(() => {
                 if (!isRecordingRef.current) return
                 if (speechDead) return
                 try {
+                  lastStartTime = Date.now()
+                  gotResultsSinceLastStart = false
                   rec.start()
                 } catch {
                   // start() throws if already started — ignore
                 }
-              }, 250)
+              }, 2000)
             }
+            lastStartTime = Date.now()
             rec.start()
             recognitionRef.current = recognition
           }
@@ -787,53 +814,19 @@ export function VoiceRecord({ onConvertToRecord, onEmergency }: VoiceRecordProps
         }
       }
 
-      // Start audio-level monitor — samples the analyser every 300ms and
-      // tracks the peak RMS. Used to detect a silent mic (hardware mute,
-      // wrong input device, etc.) so we can warn the user instead of
-      // silently letting them record 60 seconds of nothing.
+      // NOTE: The RMS-based audio-level monitor that used to live here
+      // has been REMOVED. It was fundamentally unreliable — with
+      // fftSize=64 or even 2048, the RMS reading on a perfectly working
+      // mic could read as "silent" due to browser echo cancellation,
+      // noise suppression, quiet speaking volume, or the analyser not
+      // being connected to the right source. This caused false
+      // "No microphone audio detected" warnings on working mics.
       //
-      // IMPORTANT: This is a HEURISTIC, not a hard gate. We only SHOW a
-      // non-blocking warning toast — we never abort the recording. The
-      // user's mic might be fine even if RMS is low (quiet talker, noise
-      // suppression, browser echo cancellation eating the signal, etc).
-      // The actual "did we get audio" decision happens after stop, based
-      // on the recorded BLOB SIZE, which is the only reliable signal.
+      // The ONLY reliable "did we get audio" check is the recorded
+      // Blob size after the user stops — a real 2s+ recording always
+      // produces >500 bytes of webm/opus data. That check lives in
+      // handleStopAndTranscribe and is sufficient.
       peakAudioLevelRef.current = 0
-      let silentSamples = 0
-      let warnedNoAudio = false
-      if (analyserRef.current) {
-        const an = analyserRef.current
-        const dataArray = new Uint8Array(an.fftSize)
-        audioLevelTimerRef.current = setInterval(() => {
-          an.getByteTimeDomainData(dataArray)
-          // Compute RMS around 128 (silence center)
-          let sumSq = 0
-          for (let i = 0; i < dataArray.length; i++) {
-            const v = dataArray[i] - 128
-            sumSq += v * v
-          }
-          const rms = Math.sqrt(sumSq / dataArray.length)
-          if (rms > peakAudioLevelRef.current) {
-            peakAudioLevelRef.current = rms
-          }
-          // Warn ONCE after ~6s of CONTINUOUS silence (20 samples × 300ms).
-          // 6s gives the user time to start speaking before we warn.
-          // Threshold 1 (not 2) — with smoothing, normal speech RMS is
-          // usually 5-30; pure silence is <0.5.
-          if (rms < 1) {
-            silentSamples++
-            if (!warnedNoAudio && silentSamples >= 20) {
-              warnedNoAudio = true
-              toast.warning("No microphone audio detected", {
-                description: "Check that your mic is unmuted and selected as the default input device. Recording continues, but transcript may be empty.",
-                duration: 6000,
-              })
-            }
-          } else {
-            silentSamples = 0
-          }
-        }, 300)
-      }
 
       timerRef.current = setInterval(() => {
         setSeconds((s) => {
@@ -1147,15 +1140,32 @@ export function VoiceRecord({ onConvertToRecord, onEmergency }: VoiceRecordProps
         onEmergency()
       }
     } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? (err.body as { error?: string; useWebSpeech?: boolean })?.error || err.message
-          : (err as Error).message
-      setErrorMessage(
-        msg ||
-          "Voice transcription requires browser support. Please use Chrome/Edge and allow microphone access."
-      )
-      toast.error("Transcription failed", { description: msg })
+      // The server may return `useWebSpeech: true` when server-side ASR
+      // isn't available (Vercel deployment). In that case, give the user
+      // an actionable message instead of the raw "Server-side transcription
+      // not available" text.
+      if (err instanceof ApiError) {
+        const body = err.body as { error?: string; useWebSpeech?: boolean; detail?: string }
+        if (body?.useWebSpeech) {
+          const helpfulMsg =
+            "Your browser's speech recognition didn't capture any text. Please:\n" +
+            "• Use Chrome or Edge (best Web Speech API support)\n" +
+            "• Allow microphone access when prompted\n" +
+            "• Speak clearly into the mic and try again"
+          setErrorMessage(helpfulMsg)
+          toast.error("Transcription failed", {
+            description: "No speech was captured. Use Chrome/Edge, allow mic access, and try again.",
+          })
+        } else {
+          const msg = body?.error || err.message
+          setErrorMessage(msg || "Failed to analyze voice memo.")
+          toast.error("Transcription failed", { description: msg })
+        }
+      } else {
+        const msg = (err as Error).message
+        setErrorMessage(msg || "Failed to analyze voice memo.")
+        toast.error("Transcription failed", { description: msg })
+      }
     } finally {
       setIsTranscribing(false)
       setLiveTranscript("")
