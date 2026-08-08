@@ -972,15 +972,10 @@ export function DoctorDirectory({ onBookAppointment, hideHero }: DoctorDirectory
 
   const canManageEntry = user?.role === "DOCTOR" || user?.role === "ORGANIZATION"
 
-  // Auto-fill city + pincode from logged-in user
-  useEffect(() => {
-    if (!user) return
-    setFilters((f) => ({
-      ...f,
-      city: f.city || user.city || "",
-      pincode: f.pincode || user.pincode || "",
-    }))
-  }, [user])
+  // NOTE: Do NOT auto-fill city/pincode from the logged-in user's profile.
+  // Auto-filling caused 0 results when the user's city didn't match any
+  // doctor's city (e.g. user from Delhi, doctors all in Maharashtra).
+  // Instead, show ALL doctors by default and let users filter manually.
 
   const fetchDoctors = useCallback(
     async (opts: { silent?: boolean } = {}) => {
@@ -998,20 +993,25 @@ export function DoctorDirectory({ onBookAppointment, hideHero }: DoctorDirectory
 
         const res = await apiFetch<DirResponse>(`/api/doctor-directory?${params.toString()}`)
         let list = res.doctors || []
-        // Auto-seed on first empty load
+        let resTotal = res.total || 0
+
+        // Auto-seed on first empty load (only if truly no entries exist)
         if (
           list.length === 0 &&
           total === 0 &&
           !seededRef &&
           !appliedFilters.search &&
-          !appliedFilters.category
+          !appliedFilters.category &&
+          !appliedFilters.city &&
+          !appliedFilters.pincode
         ) {
           setSeededRef(true)
           try {
             await apiFetch("/api/doctor-directory/seed", { method: "POST" })
             const retry = await apiFetch<DirResponse>(`/api/doctor-directory?${params.toString()}`)
             list = retry.doctors || []
-            setTotal(retry.total || 0)
+            resTotal = retry.total || 0
+            setTotal(resTotal)
             setDoctors(list)
             toast.info("Doctor directory seeded", {
               description: "Sample entries created from existing doctors.",
@@ -1021,8 +1021,35 @@ export function DoctorDirectory({ onBookAppointment, hideHero }: DoctorDirectory
             /* seed failed — show empty state */
           }
         }
+
+        // FALLBACK: If city/pincode filter returned 0 results, retry without
+        // location filters so the user still sees all available doctors.
+        if (
+          list.length === 0 &&
+          (appliedFilters.city || appliedFilters.pincode) &&
+          !appliedFilters.search &&
+          !appliedFilters.category
+        ) {
+          const fallbackParams = new URLSearchParams()
+          if (appliedFilters.search) fallbackParams.set("search", appliedFilters.search)
+          if (appliedFilters.category) fallbackParams.set("category", appliedFilters.category)
+          fallbackParams.set("sort", appliedFilters.sort)
+          fallbackParams.set("limit", String(PAGE_SIZE))
+          fallbackParams.set("offset", String(offset))
+          const retry = await apiFetch<DirResponse>(
+            `/api/doctor-directory?${fallbackParams.toString()}`
+          )
+          list = retry.doctors || []
+          resTotal = retry.total || 0
+          if (list.length > 0) {
+            toast.info("Showing all doctors", {
+              description: `No doctors found in your area — showing all ${resTotal} doctors.`,
+            })
+          }
+        }
+
         setDoctors(list)
-        setTotal(res.total || 0)
+        setTotal(resTotal)
       } catch (e) {
         toast.error("Failed to load doctors", { description: (e as Error).message })
         setDoctors([])
